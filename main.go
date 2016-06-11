@@ -31,54 +31,62 @@ type (
 const defaultBlockSize int = 1 << 20
 
 var (
-	inputFileName  string
-	outputFileName string
-	blockSize      int
-	workersCount   int
-	outputWriter   *bufio.Writer
+	inputFileName    string
+	outputFileName   string
+	blockSize        int
+	concurrencyLevel int
 )
 
 func init() {
 	initFlags()
-	workersCount = runtime.NumCPU()
+	concurrencyLevel = runtime.NumCPU()
 }
 
 func main() {
-	if flag.NFlag() < 2 {
-		flag.Usage()
-		os.Exit(1)
-	}
+	checkFlags()
 
-	inputFilePath, err := expandInputFilePath()
-	checkError(err)
-
-	inputFile, err := os.Open(inputFilePath)
+	inputFile, inputReader, err := createInputReader()
 	checkError(err)
 	defer inputFile.Close()
 
-	outputFile, err := createOutputFile()
+	// Will be flushed and closed in writeDigestResults
+	outputFile, outputWriter, err := createOutputWriter()
 	checkError(err)
-	outputWriter = bufio.NewWriter(outputFile)
-	defer outputFile.Close()
-	defer outputWriter.Flush()
 
-	reader := bufio.NewReaderSize(inputFile, blockSize)
-	requestChannel := make(chan *digestRequest, workersCount)
+	// Will be closed manually after reading of the input file
 	doneChannel := make(chan struct{})
-	defer close(doneChannel)
+
+	quitChannel := make(chan struct{})
+	defer close(quitChannel)
+
+	// Will be closed automatically in processDigestResponses
+	resultChannel := make(chan *digestResponse, concurrencyLevel)
+
+	responseChannel := make(chan *digestResponse)
+	defer close(responseChannel)
+
+	requestChannel := make(chan *digestRequest)
+	defer close(requestChannel)
+
 	requestId := uint64(0)
 
-	go processRequests(requestChannel, doneChannel)
+	for i := 0; i < concurrencyLevel; i++ {
+		go handleDigestRequest(requestChannel, responseChannel, doneChannel, quitChannel)
+	}
+
+	go processDigestResponses(responseChannel, resultChannel)
+	go writeDigestResults(resultChannel, outputFile, outputWriter)
 
 	for {
 		data := make([]byte, blockSize)
-		bytesCount, err := reader.Read(data)
+		bytesCount, err := inputReader.Read(data)
 
 		if err != nil && err != io.EOF {
-			log.Fatal(err)
+			log.Println(err)
+			break
 		}
 
-		// End of file reached
+		// End of file reached, exit loop and cleanup all resources
 		if bytesCount == 0 {
 			break
 		}
@@ -87,78 +95,99 @@ func main() {
 		requestChannel <- &request
 		requestId++
 	}
+
+	close(doneChannel)
+
+	// Wait for all request handlers to be finished
+	for i := 0; i < concurrencyLevel; i++ {
+		<-quitChannel
+	}
 }
 
-func processRequests(requestChannel <-chan *digestRequest, doneChannel <-chan struct{}) {
-	responseChannel := make(chan *digestResponse)
-	go processResponses(responseChannel, doneChannel)
-	defer close(responseChannel)
-
+func handleDigestRequest(requestChannel <-chan *digestRequest, responseChannel chan<- *digestResponse, doneChannel <-chan struct{}, quitChannel chan<- struct{}) {
 	for {
 		select {
 		case request := <-requestChannel:
-			go calculateDigest(request, responseChannel, doneChannel)
+			responseChannel <- &digestResponse{
+				id:  request.id,
+				sum: md5.Sum(request.data),
+			}
 		case <-doneChannel:
+			quitChannel <- struct{}{}
 			return
 		}
 	}
 }
 
-func processResponses(responseChannel <-chan *digestResponse, doneChannel <-chan struct{}) {
-	responses := make([]*digestResponse, 0, workersCount)
-	digestChannel := make(chan *digestResponse, workersCount)
-	defer close(digestChannel)
+func processDigestResponses(responseChannel <-chan *digestResponse, resultChannel chan<- *digestResponse) {
+	responses := make([]*digestResponse, 0, concurrencyLevel)
+	defer close(resultChannel)
 
-	go writeDigests(outputWriter, digestChannel)
-
-	for {
-		select {
-		case response := <-responseChannel:
-			responses = append(responses, response)
-
-			if len(responses) < workersCount {
-				continue
-			}
-
-			sort.Sort(byId(responses))
-
-			for _, r := range responses {
-				digestChannel <- r
-			}
-
-			responses = nil
-		case <-doneChannel:
+	flushResults := func() {
+		if len(responses) == 0 {
 			return
 		}
-	}
-}
 
-func calculateDigest(request *digestRequest, responseChannel chan<- *digestResponse, doneChannel <-chan struct{}) {
-	select {
-	case responseChannel <- &digestResponse{id: request.id, sum: md5.Sum(request.data)}:
-	case <-doneChannel:
-	}
-}
+		sort.Sort(byId(responses))
 
-func writeDigests(writer io.Writer, responseChannel <-chan *digestResponse) {
+		for _, result := range responses {
+			resultChannel <- result
+		}
+
+		responses = nil
+	}
+
 	for response := range responseChannel {
-		_, err := writer.Write(response.sum[:])
+		responses = append(responses, response)
+
+		if len(responses) == concurrencyLevel {
+			flushResults()
+		}
+	}
+
+	flushResults()
+}
+
+func writeDigestResults(resultChannel <-chan *digestResponse, file io.Closer, writer *bufio.Writer) {
+	defer file.Close()
+	defer writer.Flush()
+
+	for result := range resultChannel {
+		_, err := writer.Write(result.sum[:])
 		checkError(err)
 	}
 }
 
-func createOutputFile() (*os.File, error) {
+func createInputReader() (*os.File, *bufio.Reader, error) {
+	inputFilePath, err := expandInputFilePath()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	inputFile, err := os.Open(inputFilePath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("Could not read input file: %v", err)
+	}
+
+	inputFileReader := bufio.NewReaderSize(inputFile, blockSize)
+
+	return inputFile, inputFileReader, nil
+}
+
+func createOutputWriter() (*os.File, *bufio.Writer, error) {
 	outputFilePath, err := expandOutputFilePath()
 	if err != nil {
-		return nil, fmt.Errorf("Could not determine output file full path: %v", err)
+		return nil, nil, err
 	}
 
 	outputFile, err := os.Create(outputFilePath)
 	if err != nil {
-		return nil, fmt.Errorf("Could not create output file: %v", err)
+		return nil, nil, fmt.Errorf("Could not create output file: %v", err)
 	}
 
-	return outputFile, nil
+	outputWriter := bufio.NewWriterSize(outputFile, md5.Size)
+
+	return outputFile, outputWriter, nil
 }
 
 func expandInputFilePath() (string, error) {
@@ -185,7 +214,7 @@ func expandFilePath(prefix, fileName string) (string, error) {
 }
 
 func showUsage() {
-	fmt.Fprintln(os.Stderr, "Usage:\n")
+	fmt.Fprintln(os.Stderr, "Usage:")
 	flag.PrintDefaults()
 }
 
@@ -196,6 +225,13 @@ func initFlags() {
 	flag.Usage = showUsage
 
 	flag.Parse()
+}
+
+func checkFlags() {
+	if flag.NFlag() < 2 {
+		flag.Usage()
+		os.Exit(1)
+	}
 }
 
 func checkError(err error) {
@@ -213,5 +249,5 @@ func (collection byId) Swap(i, j int) {
 }
 
 func (collection byId) Less(i, j int) bool {
-	return collection[i].id < collection[j].id
+	return collection[i] != nil && collection[j] != nil && collection[i].id < collection[j].id
 }
