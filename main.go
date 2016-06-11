@@ -62,6 +62,7 @@ func main() {
 	defer close(requestChannel)
 
 	requestId := uint64(0)
+	buffer := make([]byte, blockSize)
 
 	for i := 0; i < concurrencyLevel; i++ {
 		go handleDigestRequest(requestChannel, responseChannel, doneChannel, quitChannel)
@@ -71,8 +72,7 @@ func main() {
 	go writeDigestResults(resultChannel, outputFile, outputWriter)
 
 	for {
-		data := make([]byte, blockSize)
-		bytesCount, err := inputReader.Read(data)
+		bytesCount, err := inputReader.Read(buffer)
 
 		if err != nil && err != io.EOF {
 			log.Println(err)
@@ -84,9 +84,13 @@ func main() {
 			break
 		}
 
-		request := digestRequest{id: requestId, data: data}
-		requestChannel <- &request
+		requestChannel <- &digestRequest{
+			id:   requestId,
+			data: buffer,
+		}
+
 		requestId++
+		buffer = buffer[:]
 	}
 
 	close(doneChannel)
