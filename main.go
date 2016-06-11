@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -39,7 +40,8 @@ var (
 
 func init() {
 	initFlags()
-	concurrencyLevel = runtime.NumCPU()
+
+	concurrencyLevel = int(math.Min(float64(runtime.NumCPU()), float64(runtime.GOMAXPROCS(0))))
 }
 
 func main() {
